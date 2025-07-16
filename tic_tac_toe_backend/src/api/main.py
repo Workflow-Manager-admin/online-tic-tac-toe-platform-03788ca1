@@ -1,11 +1,24 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Security
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Union
 from sqlalchemy.orm import Session
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 
 from . import database, crud
+
+class GameStatus(BaseModel):
+    board: str = Field(..., description="Current board as 9-char string")
+    turn: str = Field(..., description="Whose turn: X or O")
+    is_over: bool
+    winner: Optional[Union[int, str]] = None
+    message: str
+
+class MoveRequest(BaseModel):
+    position: int = Field(..., ge=0, le=8, description="Index on board (0-8)")
+
+class JoinGameRequest(BaseModel):
+    game_id: int
 
 app = FastAPI(
     title="Tic Tac Toe API",
@@ -140,10 +153,10 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 # PUBLIC_INTERFACE
 @app.post("/games/", response_model=GameOut, status_code=status.HTTP_201_CREATED, tags=["games"],
           summary="Create game", description="Create a new Tic Tac Toe game.")
-def create_game(game_in: GameCreate, db: Session = Depends(database.get_db)):
-    # Check player X exists
-    if not crud.get_user(db, game_in.player_x_id):
-        raise HTTPException(status_code=400, detail=f"Player X (id={game_in.player_x_id}) does not exist")
+def create_game(game_in: GameCreate, db: Session = Depends(database.get_db), user=Depends(get_current_user)):
+    # Only allow registered user to be player X (token)
+    if game_in.player_x_id != user.id:
+        raise HTTPException(status_code=403, detail="You must start the game as yourself")
     if game_in.player_o_id and not crud.get_user(db, game_in.player_o_id):
         raise HTTPException(status_code=400, detail=f"Player O (id={game_in.player_o_id}) does not exist")
     game = crud.create_game(db, player_x_id=game_in.player_x_id, player_o_id=game_in.player_o_id)
@@ -153,3 +166,78 @@ def create_game(game_in: GameCreate, db: Session = Depends(database.get_db)):
 @app.get("/games/", response_model=List[GameOut], tags=["games"], summary="List games", description="Fetch all games.")
 def list_games(db: Session = Depends(database.get_db)):
     return crud.list_games(db)
+
+# PUBLIC_INTERFACE
+@app.post("/games/join", response_model=GameOut, tags=["games"], summary="Join Game", description="Join a game as O (must be authenticated, only if O slot is available and you are neither player).")
+def join_game(data: JoinGameRequest, db: Session = Depends(database.get_db), user=Depends(get_current_user)):
+    game = crud.get_game(db, data.game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game does not exist")
+    if game.player_o_id is not None:
+        raise HTTPException(status_code=400, detail="Game already has 2 players")
+    if game.player_x_id == user.id:
+        raise HTTPException(status_code=400, detail="Cannot join your own game")
+    joined = crud.join_game(db, data.game_id, user.id)
+    if not joined:
+        raise HTTPException(status_code=400, detail="Failed to join game (already joined?)")
+    return joined
+
+# PUBLIC_INTERFACE
+@app.post("/games/{game_id}/move", response_model=GameStatus, tags=["games"], summary="Make Move",
+          description="Authenticated move for either X or O. Position 0..8, validates turn and updates state.")
+def make_move(game_id: int, move: MoveRequest, db: Session = Depends(database.get_db), user=Depends(get_current_user)):
+    game = crud.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    updated_game, state, msg = crud.make_move(db, game_id, user.id, move.position)
+    if not updated_game or not state:
+        raise HTTPException(status_code=400, detail=msg)
+    winner = None
+    if updated_game.is_over and updated_game.winner_id:
+        winner = updated_game.winner_id
+    elif updated_game.is_over:
+        winner = "draw"
+    return GameStatus(
+        board=state.board,
+        turn=state.turn.value,
+        is_over=updated_game.is_over,
+        winner=winner,
+        message=msg,
+    )
+
+# PUBLIC_INTERFACE
+@app.get("/games/{game_id}/status", response_model=GameStatus, tags=["games"], summary="Get Game Status",
+         description="Returns current board, turn, win/draw status for given game (authenticated).")
+def game_status(game_id: int, db: Session = Depends(database.get_db), user=Depends(get_current_user)):
+    game = crud.get_game(db, game_id)
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    # check user is a player of game
+    if user.id not in [game.player_x_id, game.player_o_id]:
+        raise HTTPException(status_code=403, detail="Only participating players may view live status")
+    state = crud.get_game_state(db, game_id)
+    winner = None
+    msg = "Your turn" if (state and
+        ((state.turn == "X" and user.id == game.player_x_id) or (state.turn == "O" and user.id == game.player_o_id))) else (
+            "Opponent's turn" if state and not game.is_over else ("Game over" if game.is_over else ""))
+    if game.is_over and game.winner_id is not None:
+        winner = game.winner_id
+        msg = f"Winner: Player {['X','O'][user.id==game.player_o_id]}"
+    elif game.is_over:
+        winner = "draw"
+        msg = "Draw"
+    if not state:
+        raise HTTPException(status_code=404, detail="Game state not found")
+    return GameStatus(
+        board=state.board,
+        turn=state.turn.value,
+        is_over=game.is_over,
+        winner=winner,
+        message=msg,
+    )
+
+# PUBLIC_INTERFACE
+@app.get("/users/me/history", response_model=List[GameOut], tags=["games"], summary="Get My Game History",
+         description="Get list of all games you participated in, sorted by latest.")
+def game_history(db: Session = Depends(database.get_db), user=Depends(get_current_user)):
+    return crud.get_user_games(db, user.id)
