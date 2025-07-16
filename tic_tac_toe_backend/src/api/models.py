@@ -18,6 +18,7 @@ class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
     signup_time = Column(DateTime, default=datetime.utcnow)
 
     games = relationship("Game", back_populates="player_x", foreign_keys="Game.player_x_id")

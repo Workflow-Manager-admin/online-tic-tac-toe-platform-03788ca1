@@ -2,13 +2,25 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from . import models
 from typing import Optional, List
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from jose import jwt
+import os
+
+# Password hashing context
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "dev_secret_jwt_key_change_this")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24h
 
 # --- USER CRUD ---
 
 # PUBLIC_INTERFACE
-def create_user(db: Session, username: str) -> Optional[models.User]:
-    """Create a new user. Returns user if successful, None if username exists."""
-    user = models.User(username=username)
+def create_user(db: Session, username: str, password: str) -> Optional[models.User]:
+    """Create a new user with a hashed password. Returns user if successful, None if username exists."""
+    hash_ = pwd_context.hash(password)
+    user = models.User(username=username, password_hash=hash_)
     db.add(user)
     try:
         db.commit()
@@ -17,6 +29,30 @@ def create_user(db: Session, username: str) -> Optional[models.User]:
     except IntegrityError:
         db.rollback()
         return None
+
+# PUBLIC_INTERFACE
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a plain password against its hash."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+# PUBLIC_INTERFACE
+def authenticate_user(db: Session, username: str, password: str) -> Optional[models.User]:
+    """Check username/password and return user if valid, else None."""
+    user = get_user_by_username(db, username)
+    if user and verify_password(password, user.password_hash):
+        return user
+    return None
+
+# PUBLIC_INTERFACE
+def create_access_token(*, data: dict, expires_delta: timedelta = None) -> str:
+    """Create a JWT access token encoding the specified data."""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # PUBLIC_INTERFACE
 def get_user(db: Session, user_id: int) -> Optional[models.User]:
